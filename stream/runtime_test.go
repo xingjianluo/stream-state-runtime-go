@@ -130,7 +130,8 @@ func TestDuplicateEvents(t *testing.T) {
 }
 
 func TestLateEventDropped(t *testing.T) {
-	// 单分片：先推进水位线，再投递超出允许延迟的迟到事件
+	// 单分片：推进到窗口 [0,10) 彻底关闭（关闭线 = 10 + 允许延迟 5 = 15）后，
+	// 属于该窗口的迟到事件必须拒绝且不计入聚合。
 	events := []Event{
 		{ID: "a", Key: "k", Shard: 0, Offset: 0, EventTime: ts(100), Value: 1},
 		{ID: "b", Key: "k", Shard: 0, Offset: 1, EventTime: ts(101), Value: 2},
@@ -148,9 +149,12 @@ func TestLateEventDropped(t *testing.T) {
 		t.Fatalf("LateDropped=%d, want 1", st.LateDropped)
 	}
 	for _, o := range sink.Results() {
-		if o.Sum == 99 || o.Count > 2 && o.Window.Start == ts(0) {
+		if o.Window.Start == ts(0) && (o.Sum == 99 || o.Count > 0 && o.Sum == 99) {
 			t.Fatalf("迟到事件被计入聚合: %+v", o)
 		}
+	}
+	if out, ok := sink.Get("0-10000000000/k"); ok && out.Count != 0 {
+		t.Fatalf("被拒窗口不应产出该迟到值: %+v", out)
 	}
 }
 
