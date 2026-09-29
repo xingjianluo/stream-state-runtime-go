@@ -38,7 +38,7 @@ func reference(shards [][]Event, windowSize time.Duration) map[string]Output {
 			mgr.Add(ev, time.Time{})
 		}
 	}
-	outs := mgr.FireReady(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC))
+	outs := mgr.EmitReady(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC))
 	ref := make(map[string]Output, len(outs))
 	for _, o := range outs {
 		ref[o.ID] = o

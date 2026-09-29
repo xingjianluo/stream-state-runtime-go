@@ -12,17 +12,33 @@ import (
 )
 
 // FormatVersion 为检查点格式版本，不兼容版本必须被拒绝。
-const FormatVersion = 1
+//
+// 版本历史：
+//   - v1：窗口触发后即删除状态；去重集合为纯 ID 列表；无修正版本/确认账本。
+//   - v2：窗口触发后保留到迟到容忍期结束并支持版本化修正（WindowState 新增
+//     Fired/Revision，Output 新增 Revision）；去重集合携带事件时间用于安全 GC；
+//     新增每个输出 ID 的已确认最高版本 Acks。
+const FormatVersion = 2
 
-// Checkpoint 涵盖消费位点、窗口状态、去重集合、水位线与待确认输出。
+// MinSupportedVersion 为可接受的最低检查点版本。
+const MinSupportedVersion = FormatVersion
+
+// DedupEntry 是检查点中的去重条目：事件 ID 与其所属窗口的清理时刻（UnixNano）。
+type DedupEntry struct {
+	ID      string `json:"id"`
+	PurgeAt int64  `json:"purge_at"`
+}
+
+// Checkpoint 涵盖消费位点、窗口状态、去重集合、水位线、待确认输出与确认账本。
 type Checkpoint struct {
-	Version   int
-	Seq       uint64
+	Version   int    `json:"version"`
+	Seq       uint64 `json:"seq"`
 	Offsets   map[int]uint64
 	Watermark int64 // unix nano
 	Windows   []WindowState
-	Dedup     []string
-	Pending   []Output // 已产出但未确认的输出
+	Dedup     []DedupEntry
+	Pending   []Output       // 已产出但未确认的输出（含修正版本）
+	Acks      map[string]int // 每个输出 ID 已确认的最高版本（修正进度）
 }
 
 // ErrIncompatibleCheckpoint 表示检查点版本不兼容。
@@ -92,7 +108,16 @@ func (s *FileCheckpointStore) Load(ctx context.Context) (Checkpoint, bool, error
 		return Checkpoint{}, false, fmt.Errorf("%w: 数据无法解析", ErrCorruptCheckpoint)
 	}
 	if cp.Version != FormatVersion {
-		return Checkpoint{}, false, fmt.Errorf("%w: 期望 %d, 实际 %d", ErrIncompatibleCheckpoint, FormatVersion, cp.Version)
+		switch {
+		case cp.Version < MinSupportedVersion:
+			return Checkpoint{}, false, fmt.Errorf(
+				"%w: 检查点来自旧版本 %d，低于最低支持版本 %d（当前 %d），格式不兼容；需用旧版本处理或丢弃该检查点",
+				ErrIncompatibleCheckpoint, cp.Version, MinSupportedVersion, FormatVersion)
+		default:
+			return Checkpoint{}, false, fmt.Errorf(
+				"%w: 检查点来自更新版本 %d，本运行时仅支持 %d，拒绝加载以避免破坏状态",
+				ErrIncompatibleCheckpoint, cp.Version, FormatVersion)
+		}
 	}
 	return cp, true, nil
 }
