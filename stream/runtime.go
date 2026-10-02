@@ -317,8 +317,9 @@ func (r *Runtime) process(ev Event) {
 		combined := r.wm.Advance(ev.Shard, ev.EventTime)
 		if reason := r.wins.Add(ev, combined); reason == RejectLate {
 			r.stats.LateDropped++
-			r.cfg.logf("reject: late id=%s eventTime=%s watermark=%s windowClose=%s",
+			r.cfg.logf("reject: late id=%s eventTime=%s watermark=%s lateDeadline=%s windowClose=%s",
 				ev.ID, ev.EventTime, combined,
+				ev.EventTime.Add(r.cfg.AllowedLateness),
 				r.wins.Assign(ev.EventTime).End.Add(r.cfg.AllowedLateness))
 		} else {
 			r.stats.Processed++

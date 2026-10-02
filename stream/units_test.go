@@ -37,22 +37,35 @@ func TestWindowAssignAndLateReject(t *testing.T) {
 	if w.Start != ts(10) || w.End != ts(20) {
 		t.Fatalf("窗口分配错误: %+v", w)
 	}
-	// 窗口 [0,10) 的彻底关闭线为 10+5=15：
-	// 水位线 14 时窗口尚未关闭，事件一律接收；水位线 15 起事件拒绝。
+	// 事件级迟到线 = 事件时间 + 允许延迟(5s)，与窗口大小无关；窗口关闭线 = 窗口 End + 5s。
+	// 水位线 14 时，窗口 [0,10) 的关闭线 15 尚未到达（窗口仍开着），
+	// 但事件时间 9 的旧事件：9+5=14 <= 14，落后水位线已达允许延迟上界，必须拒绝。
 	wm := ts(14)
-	if r := m.Add(Event{ID: "a", Key: "k", EventTime: ts(1), Value: 1}, wm); r != RejectNone {
-		t.Fatalf("窗口未关闭，事件应被接收, got %s", r)
+	if r := m.Add(Event{ID: "c", Key: "k", EventTime: ts(9), Value: 1}, wm); r != RejectLate {
+		t.Fatalf("事件时间+允许延迟 <= 水位线 时即使窗口未彻底关闭也应拒绝, got %s", r)
 	}
-	if r := m.Add(Event{ID: "b", Key: "k", EventTime: ts(9), Value: 1}, wm); r != RejectNone {
-		t.Fatalf("同一窗口内迟到事件也应接收（将产生修正）, got %s", r)
+	// 同一窗口内事件时间 10 属于下一窗口 [10,20)：10+5=15 > 14，正常接收。
+	if r := m.Add(Event{ID: "ok", Key: "k", EventTime: ts(10), Value: 1}, wm); r != RejectNone {
+		t.Fatalf("未越事件级迟到线的事件应被接收, got %s", r)
 	}
-	if r := m.Add(Event{ID: "c", Key: "k", EventTime: ts(0), Value: 1}, ts(15)); r != RejectLate {
+	// 仍在允许延迟内的迟到数据（事件时间 9、水位线 13：9+5=14 > 13）接收（将产生修正）。
+	if r := m.Add(Event{ID: "late-in", Key: "k", EventTime: ts(9), Value: 1}, ts(13)); r != RejectNone {
+		t.Fatalf("仍在允许延迟内的迟到事件应被接收, got %s", r)
+	}
+	// 等号边界：事件时间+允许延迟恰好等于水位线即拒绝（落后“超过”允许延迟，含恰好达到）。
+	if r := m.Add(Event{ID: "edge", Key: "k", EventTime: ts(4), Value: 1}, ts(9)); r != RejectLate {
+		t.Fatalf("事件时间+允许延迟 == 水位线 应拒绝, got %s", r)
+	}
+	// 水位线 15：窗口 [0,10) 彻底关闭，属于它的事件当然也拒绝（两条边界此时一致）。
+	if r := m.Add(Event{ID: "closed", Key: "k", EventTime: ts(0), Value: 1}, ts(15)); r != RejectLate {
 		t.Fatalf("窗口彻底关闭后事件应被拒绝, got %s", r)
 	}
-	t.Logf("窗口级 late 边界: window=[0,10) closeAt=15, watermark=14 接收 / =15 拒绝 => %s", RejectLate)
+	t.Logf("事件级 late 边界: eventTime+allowedLateness <= watermark 拒绝（窗口 [0,10) 关闭线 15 仅用于状态回收）=> %s", RejectLate)
 }
 
 func TestWindowFireAndCorrect(t *testing.T) {
+	// 窗口 10s、允许延迟 5s。
+	// 窗口 [0,10)：触发线 10，关闭线 15；事件级迟到线为“事件时间+5 <= 水位线”。
 	m := NewWindowManager(10*time.Second, 5*time.Second)
 	m.Add(Event{ID: "a", Key: "x", EventTime: ts(1), Value: 2}, ts(1))
 	m.Add(Event{ID: "b", Key: "x", EventTime: ts(2), Value: 3}, ts(2))
@@ -72,17 +85,23 @@ func TestWindowFireAndCorrect(t *testing.T) {
 	if m.ActiveWindows() != 2 {
 		t.Fatalf("首次触发后窗口状态应保留, active=%d want 2", m.ActiveWindows())
 	}
-	// 允许延迟内迟到数据并入，产生 Revision=2 的修正
-	if r := m.Add(Event{ID: "late1", Key: "x", EventTime: ts(3), Value: 4}, ts(12)); r != RejectNone {
+	// 允许延迟内迟到数据并入：事件时间 8、水位线 12（8+5=13 > 12），Revision=2
+	if r := m.Add(Event{ID: "late1", Key: "x", EventTime: ts(8), Value: 4}, ts(12)); r != RejectNone {
 		t.Fatalf("允许延迟内迟到事件应被接收, got %s", r)
 	}
 	outs = m.FireReady(ts(12))
 	if len(outs) != 1 || outs[0].Revision != 2 || outs[0].Sum != 9 || outs[0].Count != 3 {
 		t.Fatalf("修正结果错误: %+v", outs)
 	}
-	// 再次迟到：Revision=3
-	_ = m.Add(Event{ID: "late2", Key: "x", EventTime: ts(4), Value: 1}, ts(14))
-	outs = m.FireReady(ts(14))
+	// 再次迟到（仍在允许延迟内）：事件时间 7、水位线 12（7+5=12 恰好等于 -> 拒绝），
+	// 改用事件时间 8（8+5=13 > 12）产生 Revision=3
+	if r := m.Add(Event{ID: "edge-out", Key: "x", EventTime: ts(7), Value: 100}, ts(12)); r != RejectLate {
+		t.Fatalf("事件时间+允许延迟 == 水位线 应拒绝（窗口关闭线 15 未到也不收）, got %s", r)
+	}
+	if r := m.Add(Event{ID: "late2", Key: "x", EventTime: ts(9), Value: 1}, ts(13)); r != RejectNone {
+		t.Fatalf("允许延迟内迟到事件应被接收, got %s", r)
+	}
+	outs = m.FireReady(ts(13))
 	if len(outs) != 1 || outs[0].Revision != 3 || outs[0].Sum != 10 || outs[0].Count != 4 {
 		t.Fatalf("二次修正结果错误: %+v", outs)
 	}

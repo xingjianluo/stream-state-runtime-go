@@ -18,10 +18,19 @@ type WindowState struct {
 
 // WindowManager 管理滚动事件时间窗口的聚合状态、触发与修正。
 //
+// 这里有两条不同的边界，不可混用：
+//
+//	事件级迟到线（Add 的接收/拒绝判定）：事件时间 + AllowedLateness <= 水位线。
+//	  —— 严格按配置的 AllowedLateness 度量“落后水位线多少”，与窗口大小无关，
+//	     不允许被窗口跨度放大。越线事件即使所属窗口尚未彻底关闭也一律拒绝。
+//	窗口关闭线（FireReady 的状态清理）：窗口 End + AllowedLateness <= 水位线。
+//
 // 生命周期（按组合水位线）：
 //   - End <= 水位线：首次触发，输出 Revision=1，但状态保留以接收允许延迟内的迟到数据。
-//   - End < ... <= End+AllowedLateness：迟到数据并入已触发状态，产出 Revision 递增的修正。
-//   - End+AllowedLateness < 水位线：窗口彻底关闭并删除状态；之后属于该窗口的事件拒绝。
+//   - End < ... <= End+AllowedLateness：仅“事件时间+允许延迟仍晚于水位线”的迟到数据
+//     才并入已触发状态，产出 Revision 递增的修正；更早的迟到数据按事件级迟到线拒绝。
+//   - End+AllowedLateness <= 水位线：窗口彻底关闭并删除状态；此时属于该窗口的事件其
+//     事件时间+允许延迟必然也不晚于水位线，已在事件级迟到线被拒绝。
 type WindowManager struct {
 	size            time.Duration
 	allowedLateness time.Duration
@@ -74,13 +83,18 @@ func makeOutput(st *WindowState, watermark time.Time) Output {
 }
 
 // Add 将事件计入对应窗口。
-// 安全边界：事件所属窗口若已彻底关闭（窗口 End+允许延迟 <= 判定水位线），
-// 返回 RejectLate 且不修改任何状态；否则并入状态：
+// 事件级迟到判定（严格按配置，不被窗口大小放大）：当
+//
+//	事件时间 + AllowedLateness <= 判定水位线
+//
+// 即该事件落后水位线已达到/超过允许延迟时，返回 RejectLate 且不修改任何状态，
+// 即使其所属窗口尚未彻底关闭（窗口关闭线 End+AllowedLateness 更晚）。
+// 否则并入状态：
 //   - 窗口尚未首次触发：只更新中间聚合，暂不产出（等 FireReady 首次触发）。
 //   - 窗口已首次触发：产生一条 Revision 递增的修正结果，由下一次 FireReady 冲刷。
 func (m *WindowManager) Add(ev Event, watermark time.Time) RejectReason {
 	w := m.Assign(ev.EventTime)
-	if !watermark.IsZero() && !w.End.Add(m.allowedLateness).After(watermark) {
+	if !watermark.IsZero() && !ev.EventTime.Add(m.allowedLateness).After(watermark) {
 		return RejectLate
 	}
 	k := stateKey(w, ev.Key)
@@ -99,7 +113,8 @@ func (m *WindowManager) Add(ev Event, watermark time.Time) RejectReason {
 }
 
 // FireReady 处理水位线推进：返回首次触发输出与自上次调用以来并入的修正输出，
-// 并彻底清理 End+允许延迟 <= 水位线 的窗口。
+// 并彻底清理 End+允许延迟 <= 水位线 的窗口（窗口级关闭线，仅用于状态回收，
+// 不参与事件的迟到判定——后者见 Add 的事件级迟到线）。
 // 输出按 (窗口起点, 键, Revision) 排序，保证多次运行、多分片并发下结果确定。
 func (m *WindowManager) FireReady(watermark time.Time) []Output {
 	out := m.corrections
