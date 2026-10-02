@@ -37,23 +37,34 @@ func TestWindowAssignAndLateReject(t *testing.T) {
 	if w.Start != ts(10) || w.End != ts(20) {
 		t.Fatalf("窗口分配错误: %+v", w)
 	}
-	// 窗口 [0,10) 的彻底关闭线为 10+5=15：
-	// 水位线 14 时窗口尚未关闭，事件一律接收；水位线 15 起事件拒绝。
-	wm := ts(14)
-	if r := m.Add(Event{ID: "a", Key: "k", EventTime: ts(1), Value: 1}, wm); r != RejectNone {
-		t.Fatalf("窗口未关闭，事件应被接收, got %s", r)
+	// 接收边界按“事件时间 + 允许延迟”判定，与窗口 End 无关：
+	// 接收条件为 eventTime+5 > 水位线（边界相等即拒绝）。
+	//
+	// 水位线 14 时：
+	//   - @10：10+5=15 > 14，仍在允许延迟内，接收（哪怕它已经落后水位线 4s）；
+	//   - @9 ：9+5=14 <= 14，必须拒绝——尽管其窗口 [0,10) 的关闭线是 15、尚未彻底关闭。
+	if r := m.Add(Event{ID: "a", Key: "k", EventTime: ts(10), Value: 1}, ts(14)); r != RejectNone {
+		t.Fatalf("事件时间+允许延迟仍大于水位线，应被接收（将产生修正）, got %s", r)
 	}
-	if r := m.Add(Event{ID: "b", Key: "k", EventTime: ts(9), Value: 1}, wm); r != RejectNone {
-		t.Fatalf("同一窗口内迟到事件也应接收（将产生修正）, got %s", r)
+	if r := m.Add(Event{ID: "b", Key: "k", EventTime: ts(9), Value: 1}, ts(14)); r != RejectLate {
+		t.Fatalf("事件时间+允许延迟<=水位线，即使窗口未彻底关闭也必须拒绝, got %s", r)
 	}
-	if r := m.Add(Event{ID: "c", Key: "k", EventTime: ts(0), Value: 1}, ts(15)); r != RejectLate {
-		t.Fatalf("窗口彻底关闭后事件应被拒绝, got %s", r)
+	// 边界相等即拒绝：水位线 15 时 @10（10+5=15）拒绝。
+	if r := m.Add(Event{ID: "c", Key: "k", EventTime: ts(10), Value: 1}, ts(15)); r != RejectLate {
+		t.Fatalf("边界相等时应按迟到拒绝, got %s", r)
 	}
-	t.Logf("窗口级 late 边界: window=[0,10) closeAt=15, watermark=14 接收 / =15 拒绝 => %s", RejectLate)
+	// 状态不应被拒绝事件污染：只有 a（@10，属窗口 [10,20)）被计入。
+	st := m.states[stateKey(Window{Start: ts(10), End: ts(20)}, "k")]
+	if st == nil || st.Count != 1 || st.Sum != 1 {
+		t.Fatalf("被拒事件不得修改聚合状态: %+v", st)
+	}
+	t.Logf("事件时间 late 边界: accept 当 eventTime+allowedLateness > watermark；@10/wm14 接收，@9/wm14、@10/wm15 拒绝 => %s", RejectLate)
 }
 
 func TestWindowFireAndCorrect(t *testing.T) {
-	m := NewWindowManager(10*time.Second, 5*time.Second)
+	// 窗口 10s，允许延迟 10s：接收边界 = eventTime+10 > watermark；
+	// 窗口 [0,10) 的回收（关闭）线 = End+10 = 20。
+	m := NewWindowManager(10*time.Second, 10*time.Second)
 	m.Add(Event{ID: "a", Key: "x", EventTime: ts(1), Value: 2}, ts(1))
 	m.Add(Event{ID: "b", Key: "x", EventTime: ts(2), Value: 3}, ts(2))
 	m.Add(Event{ID: "c", Key: "y", EventTime: ts(11), Value: 5}, ts(11))
@@ -72,7 +83,7 @@ func TestWindowFireAndCorrect(t *testing.T) {
 	if m.ActiveWindows() != 2 {
 		t.Fatalf("首次触发后窗口状态应保留, active=%d want 2", m.ActiveWindows())
 	}
-	// 允许延迟内迟到数据并入，产生 Revision=2 的修正
+	// 允许延迟内迟到数据并入：@3 在水位线 12 时，3+10=13>12，接收 -> Revision=2
 	if r := m.Add(Event{ID: "late1", Key: "x", EventTime: ts(3), Value: 4}, ts(12)); r != RejectNone {
 		t.Fatalf("允许延迟内迟到事件应被接收, got %s", r)
 	}
@@ -80,26 +91,39 @@ func TestWindowFireAndCorrect(t *testing.T) {
 	if len(outs) != 1 || outs[0].Revision != 2 || outs[0].Sum != 9 || outs[0].Count != 3 {
 		t.Fatalf("修正结果错误: %+v", outs)
 	}
-	// 再次迟到：Revision=3
-	_ = m.Add(Event{ID: "late2", Key: "x", EventTime: ts(4), Value: 1}, ts(14))
+	// @5 在水位线 14 时，5+10=15>14，仍在允许延迟内 -> Revision=3
+	if r := m.Add(Event{ID: "late2", Key: "x", EventTime: ts(5), Value: 1}, ts(14)); r != RejectNone {
+		t.Fatalf("允许延迟内迟到事件应被接收, got %s", r)
+	}
+	// 同水位线 14 下 @3：3+10=13<=14，越过接收边界 -> 必须拒绝；
+	// 此时窗口关闭线 20 远未到达、窗口状态仍在，但该事件不得并入、不得补发修正。
+	if r := m.Add(Event{ID: "tooLateEarly", Key: "x", EventTime: ts(3), Value: 100}, ts(14)); r != RejectLate {
+		t.Fatalf("超出允许延迟（窗口尚未彻底关闭）的事件也必须拒绝, got %s", r)
+	}
 	outs = m.FireReady(ts(14))
 	if len(outs) != 1 || outs[0].Revision != 3 || outs[0].Sum != 10 || outs[0].Count != 4 {
-		t.Fatalf("二次修正结果错误: %+v", outs)
+		t.Fatalf("二次修正结果错误（被拒事件不得产生修正）: %+v", outs)
 	}
-	// 水位线 15：窗口 [0,10) 彻底关闭并清理状态（[10,20) 尚未到 End，不触发）
-	if outs := m.FireReady(ts(15)); len(outs) != 0 {
-		t.Fatalf("允许延迟用尽只清理不产出新结果: %+v", outs)
+	// 水位线 19：@9 的接收截止线 9+10=19<=19 拒绝；窗口关闭线 20 未到，状态仍保留。
+	if r := m.Add(Event{ID: "tooLateAtEdge", Key: "x", EventTime: ts(9), Value: 100}, ts(19)); r != RejectLate {
+		t.Fatalf("边界相等（eventTime+allowedLateness<=watermark）应拒绝, got %s", r)
+	}
+	if outs := m.FireReady(ts(19)); len(outs) != 0 {
+		t.Fatalf("水位线 19 不应有新触发或修正: %+v", outs)
+	}
+	if m.ActiveWindows() != 2 {
+		t.Fatalf("窗口关闭线 20 未到，状态不得提前回收, active=%d want 2", m.ActiveWindows())
+	}
+	// 水位线 20：[0,10) 到达回收边界被清理；同时 [10,20) 首次触发 y。
+	outs = m.FireReady(ts(20))
+	if len(outs) != 1 || outs[0].Key != "y" || outs[0].Revision != 1 || outs[0].Sum != 5 {
+		t.Fatalf("应只触发下一窗口 y: %+v", outs)
 	}
 	if m.ActiveWindows() != 1 {
 		t.Fatalf("窗口 [0,10) 状态应被清理, active=%d want 1", m.ActiveWindows())
 	}
-	// 水位线 20：下一窗口 [10,20) 首次触发
-	outs = m.FireReady(ts(20))
-	if len(outs) != 1 || outs[0].Key != "y" || outs[0].Revision != 1 || outs[0].Sum != 5 {
-		t.Fatalf("下一窗口首次触发结果错误: %+v", outs)
-	}
-	// 关闭后再到达的事件被拒绝，结果不再改变
-	if r := m.Add(Event{ID: "tooLate", Key: "x", EventTime: ts(0), Value: 100}, ts(15)); r != RejectLate {
+	// 窗口彻底关闭后再到达的事件被拒绝，结果不再改变
+	if r := m.Add(Event{ID: "tooLate", Key: "x", EventTime: ts(0), Value: 100}, ts(20)); r != RejectLate {
 		t.Fatalf("窗口关闭后事件应拒绝, got %s", r)
 	}
 	if outs := m.FireReady(ts(1000)); len(outs) != 0 {

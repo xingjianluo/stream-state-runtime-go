@@ -29,6 +29,11 @@ type Runtime struct {
 
 func NewRuntime(cfg Config, src Source, sink Sink) *Runtime {
 	c := cfg.withDefaults()
+	// 严格轮转正交于调度：每个分片在被轮到时必须能取到至少 1 个在途许可，
+	// 否则别的分片占满许可阻塞在交付上、游标分片却无法交付会形成循环等待。
+	if n := src.Shards(); c.InFlightLimit < n {
+		c.InFlightLimit = n
+	}
 	return &Runtime{
 		cfg:     c,
 		source:  src,
@@ -148,13 +153,13 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 // prefetch 为单个分片循环拉取批次，并逐事件交付给归并器。
 // 每条事件“先取一个在途许可、再经无缓冲通道发送”：
-//   - 绝不为尚未交付的事件持有第二个许可，因此不会出现
-//     “占着部分许可等剩余许可、归并器却无事件可处理”的循环等待；
+//   - 严格轮转下每个正在等待交付的分片至多占 1 个许可；NewRuntime 已保证
+//     InFlightLimit >= Shards，因此游标分片恒能取到许可，不会循环等待；
 //   - 取到许可后若发送阻塞，事件要么被归并器收下处理（随后释放许可），
 //     要么 ctx 取消，二者都不会造成许可泄漏或事件丢失。
 //
-// 每个分片在归并器处至多积压 1 条已交付事件（见 merge），有界上界
-// 为 InFlightLimit + Shards×FetchBatch（Fetch 批次内其余事件仍在本 goroutine 栈上）。
+// 有界上界为 InFlightLimit（已取许可的在途/待交付事件）+ Shards×FetchBatch
+// （Fetch 批次内尚未轮到取许可的事件仍在本 goroutine 栈上）。
 func (r *Runtime) prefetch(ctx context.Context, shard int, ch chan<- Event, wg *sync.WaitGroup, errCh chan<- error) {
 	defer wg.Done()
 	r.mu.Lock()
@@ -197,15 +202,18 @@ func (r *Runtime) prefetch(ctx context.Context, shard int, ch chan<- Event, wg *
 	}
 }
 
-// merge 是唯一的状态消费者：各分片事件经确定性轮转（round-robin）归并处理，
-// 保证处理顺序只取决于输入（分片号与位点），与 goroutine 调度、到达先后无关，
-// 从而水位线推进、首次触发与每次修正的 Revision 序列在多分片下完全确定。
-// 每个分片在 pending 中至多积压 1 条已交付事件，保证确定性且内存有界。
+// merge 是唯一的状态消费者：各分片事件经严格确定性轮转（round-robin）归并处理，
+// 处理顺序恒为 (shard0,off0),(shard1,off0),...,(shardN-1,off0),(shard0,off1),...，
+// 只取决于输入（分片号与位点），与 goroutine 调度、Fetch 快慢、到达先后无关。
+//
+// 严格性由“每轮只等待并消费当前游标分片的下一条事件”保证：其他分片的事件即使早已
+// 送达也被无缓冲通道挡在各 prefetch 处，绝不提前处理。因此水位线推进、首次触发与
+// 每次修正的 Revision 序列在多分片并发、不同批次大小下完全确定。
+// 无死锁前提 NewRuntime 已强制：InFlightLimit >= Shards（每个等待交付的分片至多占
+// 1 个许可，游标分片总有余量取到许可）。
 func (r *Runtime) merge(ctx context.Context, chans []chan Event, errCh <-chan error) error {
 	n := len(chans)
-	pending := make([]*Event, n) // 各分片已交付但未处理的事件（至多 1 条）
-	closed := make([]bool, n)    // prefetch 已关闭通道
-	done := make([]bool, n)      // 通道已关闭且无积压事件
+	done := make([]bool, n) // 该分片通道已关闭（其全部事件均已处理）
 	active := n
 	cursor := 0
 
@@ -222,79 +230,39 @@ func (r *Runtime) merge(ctx context.Context, chans []chan Event, errCh <-chan er
 		default:
 		}
 
-		// 非阻塞接收：仅对通道未关闭、且本地无积压事件的分片（每分片至多 1 条）。
-		for s := 0; s < n; s++ {
-			if closed[s] || pending[s] != nil {
-				continue
-			}
-			select {
-			case ev, ok := <-chans[s]:
-				if !ok {
-					closed[s] = true
-				} else {
-					ev := ev
-					pending[s] = &ev
-				}
-			default:
-			}
+		// 游标跳过已结束分片，定位本轮必须消费的那个分片。
+		for done[cursor] {
+			cursor = (cursor + 1) % n
 		}
+		s := cursor
 
-		// 从上一轮位置起轮转选择下一个有积压事件的分片。
-		chosen := -1
-		for k := 0; k < n; k++ {
-			s := (cursor + k) % n
-			if !done[s] && pending[s] != nil {
-				chosen = s
-				break
-			}
+		// 只等当前游标分片：其他分片即便已就绪也不抢跑，杜绝调度导致的顺序漂移。
+		cases := []reflect.SelectCase{
+			{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())},
+			{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(errCh)},
+			{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(chans[s])},
 		}
-
-		if chosen == -1 {
-			// 无可立即处理的事件：把“通道已关闭且无积压”的分片正式标记结束。
-			for s := 0; s < n; s++ {
-				if !done[s] && closed[s] && pending[s] == nil {
-					done[s] = true
-					active--
-				}
+		chosen, val, recvOK := reflect.Select(cases)
+		switch chosen {
+		case 0:
+			return ctx.Err()
+		case 1:
+			if err, _ := val.Interface().(error); err != nil {
+				return err
 			}
-			if active == 0 {
-				return nil
-			}
-			// 等待仍未关闭的分片交付或取消。case 动态构造，显式记录 case -> shard 映射
-			// （已关闭分片被排除，编号会错位，不能假设 case 编号等于 shard）。
-			cases := make([]reflect.SelectCase, 0, active+1)
-			caseShards := make([]int, 0, active)
-			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())})
-			for s := 0; s < n; s++ {
-				if !closed[s] {
-					cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(chans[s])})
-					caseShards = append(caseShards, s)
-				}
-			}
-			chosenCase, val, recvOK := reflect.Select(cases)
-			if chosenCase == 0 {
-				return ctx.Err()
-			}
-			s := caseShards[chosenCase-1]
-			if !recvOK {
-				closed[s] = true
-			} else {
-				ev := val.Interface().(Event)
-				pending[s] = &ev
-			}
+			continue // 防御：errCh 上不写入 nil
+		}
+		if !recvOK {
+			done[s] = true
+			active--
+			cursor = (s + 1) % n
 			continue
 		}
 
-		// 处理该事件并释放其在途许可。
-		ev := *pending[chosen]
-		r.process(ev)
+		// 处理该事件并释放其在途许可，游标严格推进到下一分片。
+		r.process(val.Interface().(Event))
 		<-r.sem
-		pending[chosen] = nil
-		if closed[chosen] {
-			done[chosen] = true
-			active--
-		}
-		cursor = (chosen + 1) % n
+		cursor = (s + 1) % n
 
 		// 每条事件处理完即冲刷：首次触发与每次修正按确定顺序尽快送达下游。
 		if err := r.flushPending(ctx); err != nil {
@@ -317,8 +285,9 @@ func (r *Runtime) process(ev Event) {
 		combined := r.wm.Advance(ev.Shard, ev.EventTime)
 		if reason := r.wins.Add(ev, combined); reason == RejectLate {
 			r.stats.LateDropped++
-			r.cfg.logf("reject: late id=%s eventTime=%s watermark=%s windowClose=%s",
+			r.cfg.logf("reject: late id=%s eventTime=%s watermark=%s acceptDeadline=%s windowClose=%s",
 				ev.ID, ev.EventTime, combined,
+				ev.EventTime.Add(r.cfg.AllowedLateness),
 				r.wins.Assign(ev.EventTime).End.Add(r.cfg.AllowedLateness))
 		} else {
 			r.stats.Processed++

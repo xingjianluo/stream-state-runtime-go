@@ -16,8 +16,29 @@
 
 ### 迟到数据与结果修正（Correction）
 
-窗口在 `End + AllowedLateness <= 水位线` 时才**彻底关闭**。首次触发之后、彻底关闭之前到达的
-迟到数据会并入同一 `(窗口, 键)` 并产出**修正结果**。
+系统里有**两条相互独立的边界**，分别回答"这条输入收不收"和"这份状态能不能回收"，
+配置语义以前者为准，允许延迟就是 `AllowedLateness` 本身，**不会被窗口大小放大**：
+
+| 边界 | 判定式 | 作用 |
+|---|---|---|
+| **接收边界（按事件时间，逐事件）** | `eventTime + AllowedLateness > 水位线` 才接收 | 决定一条迟到事件是并入并产生修正，还是按 `RejectLate` 直接丢弃 |
+| **回收边界（按窗口，逐窗口）** | `windowEnd + AllowedLateness <= 水位线` 才关闭 | 决定何时删除窗口聚合状态、回收相关去重 ID |
+
+两条线相差最多一个窗口大小（窗口内最早事件时间 = `windowEnd - WindowSize`），
+因此窗口在接收边界之后、回收边界之前会处于一个明确的中间阶段：
+
+- **什么情况下迟到数据还能产生修正**：窗口已首次触发（`windowEnd <= 水位线`），
+  但该事件满足 `eventTime + AllowedLateness > 水位线`——即它落后水位线的时间
+  **不超过** `AllowedLateness`。此时事件并入同一 `(窗口, 键)` 并产出一条
+  `Revision` 递增的修正。
+- **什么情况下即使窗口还没彻底关闭也必须拒绝**：只要
+  `eventTime + AllowedLateness <= 水位线`，该事件就**立即按迟到丢弃**，
+  不计入聚合、不产生任何结果（包括不给下游补发修正）——**哪怕其所属窗口此刻
+  尚未到达回收线、状态仍在内存里**。例如 10s 窗口、5s 允许延迟，水位线 17 时
+  事件时间 11 的事件（11+5=16 ≤ 17）必须拒绝，而它所在窗口 `[10,20)` 的回收线
+  是 25，此时窗口确实还开着。判定相等（恰好落后一个允许延迟）也按拒绝处理。
+- 窗口到 `windowEnd + AllowedLateness <= 水位线` 时才**彻底关闭**并清理状态；
+  此后该窗口的任何事件自然也都越过接收边界，一律拒绝。
 
 下游契约（`Output` 字段）：
 
@@ -36,28 +57,36 @@
   最终都只剩最新一版，与“所有数据一次性算完”的结果**逐窗口逐键完全一致**。
 
 **多分片下的确定性**：摄取虽然并发（每分片一个 goroutine），但所有状态写入由唯一消费者按
-**分片轮转（round-robin，按分片号与位点）**串行归并，处理顺序只取决于输入，与 goroutine
-调度、到达先后无关。因此每次修正的 `Revision` 及其先后顺序在多分片并发下也是确定的。
+**严格分片轮转（round-robin，按分片号与位点）**串行归并：归并器每轮只等待并消费当前游标
+分片的下一条事件，其他分片提前就绪也不抢跑。处理顺序恒为
+`(shard0,off0),(shard1,off0),…,(shardN,off0),(shard0,off1),…`，只取决于输入，与 goroutine
+调度、各分片 Fetch 快慢、`FetchBatch` / `InFlightLimit` 取值无关。因此每次修正的
+`Revision` 及其先后顺序在多分片并发、不同批次大小与不同调度下也是确定的。
+（`InFlightLimit` 会被自动钳制到不小于分片数，保证严格轮转下各分片都能推进、不会循环等待。）
 
 > 内置 `MemSink` 已实现上述“同版去重、旧版不回退、整版覆盖”的幂等语义，可直接作为参考实现。
 
 ### 状态清理的安全边界（长期在线、规模有界）
 
 长期运行下，两类状态都在水位线推进时持续回收，规模稳定在与
-“活跃窗口跨度 × 键数”相关的**常量级**，不随运行天数 / 总事件量增长：
+"活跃窗口跨度 × 键数"相关的**常量级**，不随运行天数 / 总事件量增长。
+**修复接收边界不会放松回收边界**：接收判定按事件时间收紧，回收仍只在窗口
+回收线（`windowEnd + AllowedLateness <= 水位线`）进行，回收时机不后移：
 
-- **窗口状态**：窗口在 `End + AllowedLateness <= 水位线`（彻底关闭）时删除。
-- **去重集合**：某事件 ID 所属窗口彻底关闭后，才回收该 ID（`DedupStore.CollectBefore`）。
+- **窗口状态**：窗口在回收线 `End + AllowedLateness <= 水位线`（彻底关闭）时删除。
+- **去重集合**：某事件 ID 所属窗口到达回收线后，才回收该 ID（`DedupStore.CollectBefore`）。
 
-安全边界非常明确，二者共用同一条关闭线：
+安全性论证（接收边界早于回收边界，回收只晚不早）：
 
-1. 只要窗口尚未彻底关闭，属于它的迟到事件仍可能改变结果，其窗口聚合状态与相关事件 ID
-   **都不会被清理**——因此不会把迟到数据算错。
-2. 窗口彻底关闭后，属于它的任何事件都会被按 `RejectLate` 拒绝、不计入聚合；此时即使其
-   去重 ID 已被回收，重复投递的副本也只会被当作迟到拒绝，**不会被重复计入**。
+1. 窗口内最晚的事件时间严格小于窗口 `End`，所以只要窗口尚未到达回收线，
+   就**仍可能存在**满足接收边界的迟到事件（时间落在 `End` 附近的尾部）。
+   这些可能再改变结果的窗口聚合状态与相关事件 ID **都不会被提前清理**。
+2. 窗口到达回收线后，其任何事件都必然满足 `eventTime + AllowedLateness <= 水位线`，
+   一律被接收边界拒绝、不计入聚合；此时即使去重 ID 已被回收，重复投递的副本
+   也只会被当作迟到拒绝，**不会被重复计入**。
 
-也就是说：**可能再改变结果的输入**和**之后仍需被认出的重复事件**，在窗口关闭前都受保护；
-窗口关闭后回收它们不可能影响任何结果。可通过 `Runtime.StateSizes()` 观察
+也就是说：**可能再改变结果的输入**和**之后仍需被认出的重复事件**，在窗口回收线前都受保护；
+回收线之后回收它们不可能影响任何结果。可通过 `Runtime.StateSizes()` 观察
 `(窗口状态数, 去重 ID 数)`，回收量计入 `Stats.DedupGC`。
 
 > 注：状态驻留峰值与“最慢分片相对落后的时间跨度”有关。各分片事件时间大致齐步推进时
@@ -86,9 +115,14 @@
   → **先补发待确认输出（含修正，Sink 按 `(ID,Revision)` 幂等）** → 从位点继续消费。
 - 一致性保证：
   - **已确认结果不重复、不回退**：恢复重放相同或更旧 `Revision` 都被 Sink 忽略。
+    即检查点之前已确认过的结果，恢复后不会再给下游出现第二遍。
   - **修正进度不倒退、不重复**：`Fired/Revision` 随检查点持久化，恢复后在原修订号上继续。
-  - **未确认结果不丢失**：崩溃时未确认的输出（含修正）随检查点持久化，恢复后必然重发。
-  - **恢复后再到迟到数据能正确接续**：窗口只要尚未彻底关闭，恢复后仍可继续修正。
+  - **未确认结果不丢失**：崩溃时未确认的输出（含修正）随检查点持久化，恢复后必然重发；
+    Sink 按 `(ID,Revision)` 幂等，重发最多生效一次。
+  - **恢复后再到迟到数据能正确接续**：窗口只要尚未到达回收线，恢复后仍可继续修正；
+    接收边界与回收边界的判定与恢复前完全一致——越过 `eventTime+AllowedLateness`
+    的事件即使窗口仍开着也照样拒绝，允许延迟内的事件在持久化的 `Revision` 上继续修正。
+  - 恢复后水位线按检查点中的组合水位线还原，因此"哪些事件算迟到"在重启前后保持一致。
 
 ### 背压与有界并发
 
@@ -105,7 +139,7 @@
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `WindowSize` | 1m | 滚动窗口大小 |
-| `AllowedLateness` | 0 | 允许延迟：窗口在 `End+AllowedLateness` 前可被迟到数据修正 |
+| `AllowedLateness` | 0 | 允许延迟（按**事件时间**判定，不随窗口大小放大）：`eventTime+AllowedLateness <= 水位线` 的输入按迟到拒绝；窗口状态仍保留到窗口回收线 `End+AllowedLateness` |
 | `FetchBatch` | 16 | 单次拉取最大事件数 |
 | `InFlightLimit` | 64 | 在途事件上限（背压阈值） |
 | `CheckpointEvery` | 32 | 每处理 N 条事件做一次检查点 |
@@ -119,7 +153,7 @@
 ```go
 cfg := stream.Config{
     WindowSize:      10 * time.Second,
-    AllowedLateness: 10 * time.Second, // 窗口触发后 10s 内的迟到数据会产生修正
+    AllowedLateness: 10 * time.Second, // 落后水位线不超过 10s 的迟到数据会产生修正，超过即丢弃
     InFlightLimit:   64,
     CheckpointStore: &stream.FileCheckpointStore{Path: "state/cp.json"},
     Logger:          func(f string, a ...any) { log.Printf(f, a...) },
@@ -137,18 +171,34 @@ if err := rt.Run(ctx); err != nil { /* 取消或上游错误，检查点已尽�
 ## 验证方法
 
 ```bash
-go test ./stream/ -v                    # 全部测试，日志含水位线/修正/回收/检查点/背压依据
-go test ./stream/ -race -count=5        # 竞态检测 + 多遍复验，确认无死锁/无竞态/结果稳定
+# 全部测试，日志含水位线/接收截止线/窗口关闭线/修正/回收/检查点/背压依据
+go test ./stream/ -v
+# 只复现迟到接收边界（含恢复边界与多分片确定性矩阵）
+go test ./stream/ -v -run 'TestLateEventBeyondAllowedLatenessRejected|TestAllowedLatenessNotScaledByWindow|TestLateBoundary'
+# 竞态检测 + 多遍复验，确认无死锁/无竞态/结果稳定
+go test ./stream/ -race -count=5
 ```
 
 修正与长期运行相关的测试覆盖：
 
+- `TestLateEventBeyondAllowedLatenessRejected`：**核心边界复现**——水位线超过
+  "事件时间 + 允许延迟"后，送一条属于尚未彻底关闭窗口的旧事件，确认它被按迟到拒绝，
+  处理量、修正数与下游结果都不受影响。
+- `TestAllowedLatenessNotScaledByWindow`：同样的"落后水位线 6s、允许延迟 5s"，
+  在 10s / 10min 窗口、事件位于窗口前部/尾部/深处等组合下，接收/拒绝恒由
+  `eventTime+AllowedLateness` 决定，允许延迟不被窗口大小放大；允许延迟内的迟到继续修正。
+- `TestLateBoundaryDeterministicAcrossShardingAndBatches`：两分片流中注入允许延迟内修正
+  与越界拒绝事件，在 3 种 `FetchBatch/InFlightLimit` 配置 × 多轮调度下，
+  每个输出的修订版本序列（版本号与每版累计值）与拒绝计数完全一致。
+- `TestLateBoundaryAfterRecovery`：检查点恢复后，已确认修订不重发、进度不倒退，
+  允许延迟内迟到继续递增修订，越界事件（窗口未关闭）照样拒绝。
 - `TestLateCorrectionConverges`：同一窗口被多次迟到数据修正，`Revision=1..N` 单调、
-  数值逐步收敛到与“一次性算完”一致的终值。
+  数值逐步收敛到与"一次性算完"一致的终值。
 - `TestCorrectionRetryIdempotent`：同版重发去重、旧版晚到不回退、整版覆盖不累加。
 - `TestCorrectionOrderDeterministic`：多分片下多次运行的修订序列完全一致。
 - `TestStateSizeBounded` / `TestStateSizePeakBounded`：长时间大流量结束状态归零、
-  回收量等于处理量；中途窗口/去重峰值为与总时长无关的常量（8 倍流量峰值不变）。
+  回收量等于处理量；中途窗口/去重峰值为与总时长无关的常量（8 倍流量峰值不变），
+  验证收紧接收边界后回收边界没有变松。
 - `TestCorrectionRecovery`：崩溃恢复后修订进度不倒退/不重复，恢复后的迟到数据继续正确修正。
 - `TestWindowRevisionSnapshotRestore`：`Fired/Revision` 经检查点快照往返完整保留。
 - `TestCheckpointV1RejectedEndToEnd` / `TestCheckpointCorruptAndIncompatible` /

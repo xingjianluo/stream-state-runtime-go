@@ -5,7 +5,7 @@ import "time"
 // Config 为运行时配置项。
 type Config struct {
 	WindowSize      time.Duration // 滚动窗口大小
-	AllowedLateness time.Duration // 允许延迟：事件时间 <= 水位线-允许延迟 的事件被拒绝
+	AllowedLateness time.Duration // 允许延迟（按事件时间判定，不随窗口大小放大）：事件时间+AllowedLateness <= 水位线 的输入按迟到拒绝
 	FetchBatch      int           // 每次拉取的最大事件数
 	InFlightLimit   int           // 在途事件上限（背压）：已拉取未处理的事件总数不超过该值
 	CheckpointEvery int           // 每处理多少事件做一次检查点

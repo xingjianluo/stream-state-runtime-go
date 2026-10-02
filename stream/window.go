@@ -18,10 +18,23 @@ type WindowState struct {
 
 // WindowManager 管理滚动事件时间窗口的聚合状态、触发与修正。
 //
+// 这里有两条相互独立的边界，切勿混用：
+//
+//  1. 接收边界（按“事件时间 + 允许延迟”判定，作用于每条输入）：
+//     当 ev.EventTime+AllowedLateness <= 水位线 时，事件按 RejectLate 拒绝，
+//     不修改任何状态、不产生任何输出——即使其所属窗口尚未彻底关闭也一样。
+//     允许延迟的长度就是 AllowedLateness 本身，不会被窗口大小放大：
+//     落后水位线超过允许延迟的输入稳定拒绝；仍在允许延迟内的迟到数据并入并修正。
+//  2. 回收边界（按“窗口 End + 允许延迟”判定，作用于状态清理）：
+//     窗口 [Start,End) 内最晚的事件时间严格小于 End，因此当
+//     End+AllowedLateness <= 水位线 时，该窗口的任何事件都必然越过接收边界，
+//     此时才彻底关闭并删除窗口状态、回收相关去重 ID。
+//
 // 生命周期（按组合水位线）：
 //   - End <= 水位线：首次触发，输出 Revision=1，但状态保留以接收允许延迟内的迟到数据。
-//   - End < ... <= End+AllowedLateness：迟到数据并入已触发状态，产出 Revision 递增的修正。
-//   - End+AllowedLateness < 水位线：窗口彻底关闭并删除状态；之后属于该窗口的事件拒绝。
+//   - 首次触发之后：只有满足接收边界的迟到数据才并入，产出 Revision 递增的修正；
+//     越过接收边界的迟到数据一律拒绝，哪怕窗口状态此刻仍保留着。
+//   - End+AllowedLateness <= 水位线：窗口彻底关闭并删除状态；之后属于该窗口的事件拒绝。
 type WindowManager struct {
 	size            time.Duration
 	allowedLateness time.Duration
@@ -74,13 +87,18 @@ func makeOutput(st *WindowState, watermark time.Time) Output {
 }
 
 // Add 将事件计入对应窗口。
-// 安全边界：事件所属窗口若已彻底关闭（窗口 End+允许延迟 <= 判定水位线），
-// 返回 RejectLate 且不修改任何状态；否则并入状态：
+//
+// 接收边界（与窗口大小无关）：事件时间满足 ev.EventTime+AllowedLateness <= 判定水位线
+// 时，按 RejectLate 拒绝，且不修改任何状态、不产生修正。注意这是按事件时间判定，
+// 不是按窗口 End 判定——事件可能落在窗口前部，此时窗口虽未彻底关闭（窗口状态仍保留、
+// 去重 ID 仍受保护），该事件也必须丢弃。
+//
+// 未越过接收边界的事件并入状态：
 //   - 窗口尚未首次触发：只更新中间聚合，暂不产出（等 FireReady 首次触发）。
 //   - 窗口已首次触发：产生一条 Revision 递增的修正结果，由下一次 FireReady 冲刷。
 func (m *WindowManager) Add(ev Event, watermark time.Time) RejectReason {
 	w := m.Assign(ev.EventTime)
-	if !watermark.IsZero() && !w.End.Add(m.allowedLateness).After(watermark) {
+	if !watermark.IsZero() && !ev.EventTime.Add(m.allowedLateness).After(watermark) {
 		return RejectLate
 	}
 	k := stateKey(w, ev.Key)
@@ -99,7 +117,9 @@ func (m *WindowManager) Add(ev Event, watermark time.Time) RejectReason {
 }
 
 // FireReady 处理水位线推进：返回首次触发输出与自上次调用以来并入的修正输出，
-// 并彻底清理 End+允许延迟 <= 水位线 的窗口。
+// 并按回收边界清理 End+允许延迟 <= 水位线 的窗口状态。
+// 注意：这里的“窗口 End+允许延迟”只用于状态回收；单条事件是否接收由 Add 按
+// “事件时间+允许延迟”判定，两条边界互不替代。
 // 输出按 (窗口起点, 键, Revision) 排序，保证多次运行、多分片并发下结果确定。
 func (m *WindowManager) FireReady(watermark time.Time) []Output {
 	out := m.corrections
